@@ -15,13 +15,21 @@
  */
 package com.linecorp.armeria.server;
 
+import java.util.List;
+import java.util.stream.Collectors;
+
+import com.google.common.collect.ImmutableList;
+
 import com.linecorp.armeria.common.AggregatedHttpResponse;
 import com.linecorp.armeria.common.ExchangeType;
 import com.linecorp.armeria.common.HttpHeaderNames;
+import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
+import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.ResponseHeaders;
+import com.linecorp.armeria.common.annotation.Nullable;
 
 /**
  * Handles the {@link HttpRequest}s that are not matched by any user-specified {@link Route}s.
@@ -44,6 +52,9 @@ final class FallbackService implements HttpService {
         final HttpStatusException cause = routingCtx.deferredStatusException();
         if (cause == null || cause.httpStatus() == HttpStatus.NOT_FOUND) {
             return handleNotFound(ctx, routingCtx);
+        }
+        if (cause.httpStatus() == HttpStatus.METHOD_NOT_ALLOWED) {
+            return handleMethodNotAllowed(ctx, routingCtx);
         }
         return newFallbackResponse(ctx, cause.httpStatus());
     }
@@ -88,6 +99,49 @@ final class FallbackService implements HttpService {
         return HttpResponse.of(ResponseHeaders.builder(HttpStatus.TEMPORARY_REDIRECT)
                                               .add(HttpHeaderNames.LOCATION, location)
                                               .build());
+    }
+
+    private static HttpResponse handleMethodNotAllowed(ServiceRequestContext ctx, RoutingContext routingCtx) {
+        // RFC 9110 requires an 'Allow' header in a '405 Method Not Allowed' response.
+        // Find the methods supported by the target resource by routing the request again with each method.
+        final VirtualHost virtualHost = ctx.config().virtualHost();
+        final String allow = HttpMethod.knownMethods().stream()
+                                       .filter(method -> method != routingCtx.method())
+                                       .filter(method -> isAllowed(virtualHost, routingCtx, method))
+                                       .map(HttpMethod::name)
+                                       .collect(Collectors.joining(","));
+
+        final HttpResponse res = newFallbackResponse(ctx, HttpStatus.METHOD_NOT_ALLOWED);
+        if (allow.isEmpty()) {
+            return res;
+        }
+        return res.mapHeaders(headers -> {
+            // Respect the status and the 'Allow' header rendered by a custom error handler.
+            if (headers.status() != HttpStatus.METHOD_NOT_ALLOWED || headers.contains(HttpHeaderNames.ALLOW)) {
+                return headers;
+            }
+            return headers.withMutations(builder -> builder.set(HttpHeaderNames.ALLOW, allow));
+        });
+    }
+
+    private static boolean isAllowed(VirtualHost virtualHost, RoutingContext routingCtx, HttpMethod method) {
+        // '405 Method Not Allowed' is decided by the path only, so ignore 'Content-Type' and 'Accept'.
+        // It also keeps the deferred status of the original context from being overwritten with 415 or 406.
+        final RoutingContext routingCtxWithMethod = new RoutingContextWrapper(routingCtx.withMethod(method)) {
+            @Nullable
+            @Override
+            public MediaType contentType() {
+                return null;
+            }
+
+            @Override
+            public List<MediaType> acceptTypes() {
+                return ImmutableList.of();
+            }
+        };
+        final Routed<ServiceConfig> routed = virtualHost.findServiceConfig(routingCtxWithMethod);
+        // A fallback route, e.g. the one added for a trailing slash redirect, does not serve the method.
+        return routed.isPresent() && !routed.route().isFallback();
     }
 
     private static HttpResponse newFallbackResponse(ServiceRequestContext ctx, HttpStatus status) {
